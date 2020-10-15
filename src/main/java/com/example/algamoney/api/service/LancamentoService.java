@@ -1,0 +1,168 @@
+package com.example.algamoney.api.service;
+
+import java.io.InputStream;
+import java.sql.Date;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+
+import javax.validation.Valid;
+
+import org.slf4j.Logger;
+import org.springframework.beans.BeanUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.EmptyResultDataAccessException;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+import com.example.algamoney.api.dto.lancamentoestatisticaPessoa;
+import com.example.algamoney.api.mail.Mailer;
+import com.example.algamoney.api.model.Lancamento;
+import com.example.algamoney.api.model.Pessoa;
+import com.example.algamoney.api.model.Usuario;
+import com.example.algamoney.api.repository.LancamentoRepository;
+import com.example.algamoney.api.repository.PessoaRepository;
+import com.example.algamoney.api.repository.UsuarioRepository;
+import com.example.algamoney.api.service.exception.PessoaInexistenteOuInativaException;
+import com.example.algamoney.api.storage.S3;
+
+import net.sf.jasperreports.engine.JasperExportManager;
+import net.sf.jasperreports.engine.JasperFillManager;
+import net.sf.jasperreports.engine.JasperPrint;
+import net.sf.jasperreports.engine.data.JRBeanCollectionDataSource;
+
+@Service
+public class LancamentoService {
+	
+	private static final String DESTINATARIOS = "ROLE_PESQUISAR_LANCAMENTO";
+	
+	//private static final Logger logger = LoggerFactory.getLogger(LancamentoService.class);
+	private static final Logger logger = org.slf4j.LoggerFactory.getLogger(Lancamento.class);
+
+	@Autowired
+	private PessoaRepository pessoaRepository;
+	
+	@Autowired
+	private LancamentoRepository lancamentoRepository;
+	
+	@Autowired
+	private UsuarioRepository usuarioRepository;
+	
+	@Autowired
+	private Mailer mailer;
+	
+	@Autowired
+	private S3 s3;
+	
+	public byte[] relatorioPorPessoa(LocalDate inicio, LocalDate fim) throws Exception {
+		
+		List<lancamentoestatisticaPessoa> dados = lancamentoRepository.porPessoa(inicio, fim);
+		
+		Map<String, Object> parametros = new HashMap<String, Object>();
+		parametros.put("DT_INICIO", Date.valueOf(inicio));
+		parametros.put("DT_FIM", Date.valueOf(fim));
+		parametros.put("REPORT_LOCALE", new Locale("pt", "BR"));
+		
+		InputStream inputStream = this.getClass().getResourceAsStream("/relatorios/lancamentos-por-pessoa.jasper");
+		
+		JasperPrint jasperPrint = JasperFillManager.fillReport(inputStream, parametros, new JRBeanCollectionDataSource(dados));
+		
+		return JasperExportManager.exportReportToPdf(jasperPrint);
+	}
+	
+	public Lancamento salvar(@Valid Lancamento lancamento) {
+
+		Pessoa pessoa = pessoaRepository.findById(lancamento.getPessoa().getCodigo()).orElseThrow(() -> new EmptyResultDataAccessException(0));
+		
+		if(pessoa == null || pessoa.isInativo()) {
+		throw new PessoaInexistenteOuInativaException();	
+		}
+		
+		if(StringUtils.hasText(lancamento.getAnexo())) {
+			s3.salvar(lancamento.getAnexo());
+		}
+		
+		
+		return lancamentoRepository.save(lancamento);
+	}
+	
+	public Lancamento atualizar(Long codigo, Lancamento lancamento) {
+		Lancamento lancamentoSalvo = buscarLancamentoExistente(codigo);
+		if (!lancamento.getPessoa().equals(lancamentoSalvo.getPessoa())) {
+			validarPessoa(lancamento);
+		}
+		
+		if(StringUtils.isEmpty(lancamento.getAnexo()) && StringUtils.hasText(lancamentoSalvo.getAnexo())) {
+			
+			s3.remover(lancamentoSalvo.getAnexo());
+		
+		} else if (StringUtils.hasText(lancamento.getAnexo()) && !lancamento.getAnexo().equals(lancamentoSalvo.getAnexo())) {
+			
+			s3.substituir(lancamentoSalvo.getAnexo(), lancamento.getAnexo());
+		}
+
+		BeanUtils.copyProperties(lancamento, lancamentoSalvo, "codigo");
+
+		return lancamentoRepository.save(lancamentoSalvo);
+	}
+	
+	
+	
+	private Lancamento buscarLancamentoExistente(Long codigo) {
+	    Optional<Lancamento> lancamentoSalvoOpt = lancamentoRepository.findById(codigo);
+
+	    // se o valor estiver presente, retorna o valor, senão lança uma exceção
+	    return lancamentoSalvoOpt.orElseThrow(() -> new IllegalArgumentException()); 
+	}
+	
+	
+	
+	private void validarPessoa(Lancamento lancamento) {
+	    Pessoa pessoaOpt = null;  
+
+	    if (lancamento.getPessoa().getCodigo() != null) {
+	        pessoaOpt = pessoaRepository.findById(lancamento.getPessoa().getCodigo()).orElseThrow(() -> new EmptyResultDataAccessException(0));
+	    }
+		
+	    if (pessoaOpt == null  || pessoaOpt.isInativo()) {
+	        throw new PessoaInexistenteOuInativaException();
+	    }
+	}
+	
+	@Scheduled(cron = "0 0 6 * * *")
+	//@Scheduled(fixedDelay = 1000 * 60 * 10)
+	public void avisarSobreLancamentosVencidos() {
+		
+		if(logger.isDebugEnabled()) {
+			logger.debug("Preparando envio de e-mails de aviso de lançamentos vencidos");
+		}
+		
+		List<Lancamento> vencidos = lancamentoRepository.findByDataVencimentoLessThanEqualAndDataPagamentoIsNull(LocalDate.now());
+		
+		if(vencidos.isEmpty()) {
+			logger.info("Sem lançamentos vencidos para aviso.");
+			return;
+		}
+		
+		logger.info("Existem {} lançamentos vencidos", vencidos.size());
+		
+		List<Usuario> destinatarios = usuarioRepository.findByPermissoesDescricao(DESTINATARIOS);
+		
+		if(destinatarios.isEmpty()) {
+			logger.warn("Existem lançamentos vencidos mas o sistema não encontrou destinatários.");
+			return;
+		}
+		
+		mailer.avisarSobreLancamentosVencidos(vencidos, destinatarios);
+		
+		logger.info("Envio de e-mail de aviso concluído.");
+		
+		
+	}
+
+}
